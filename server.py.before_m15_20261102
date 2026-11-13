@@ -1,0 +1,361 @@
+import asyncio
+import csv
+import json
+import os
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse
+from pydantic import BaseModel
+
+from tvkit.api.chart.ohlcv import OHLCV
+from logic import MarketAnalyzer, detect_profile, detect_interval
+from adapter import from_tradingview
+
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+DEFAULT_SYMBOL = "FX:EURUSD"
+HISTORY_COUNT = 200
+UPDATE_INTERVAL = 5
+SIGNALS_FILE = "signals.csv"
+
+MIN_ANY_INTERVAL = 60
+MIN_SIGNAL_INTERVAL = 300
+STRONG_SCORE_THRESHOLD = 80
+EXTREME_SCORE = 90
+OPPOSITE_SCORE_BONUS = 10
+SAME_SCORE_BONUS = 20
+MIN_PRICE_MOVE_PCT = 0.005
+# ============================================================
+
+
+state_holder = {
+    "symbol": DEFAULT_SYMBOL,
+    "restart": asyncio.Event(),
+}
+
+clients: set[WebSocket] = set()
+last_state: dict = {}
+
+last_logged_signal = {
+    "action": None,
+    "symbol": None,
+    "time": None,
+    "score": 0,
+    "price": 0,
+}
+
+
+class SwitchRequest(BaseModel):
+    symbol: str
+
+
+# ============================================================
+# CSV
+# ============================================================
+def init_csv():
+    if not os.path.exists(SIGNALS_FILE):
+        with open(SIGNALS_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow([
+                "Дата (GMT)", "Время (GMT)", "Актив", "Профиль", "Сигнал",
+                "Цена входа", "Score", "Сила", "Причина",
+                "Стоп", "Тейк", "R:R",
+                "RSI", "Давление", "Импульс",
+                "Тренд", "CHoCH",
+            ])
+
+
+def log_signal(state: dict):
+    global last_logged_signal
+
+    action = state.get('signal', {}).get('action', 'wait')
+    symbol = state.get('symbol', '—')
+    score = state.get('signal', {}).get('score', 0)
+    profile = state.get('profile', 'forex')
+    price = state.get('current_price', 0)
+
+    if action == 'wait':
+        return
+
+    now = datetime.now(timezone.utc)
+
+    if last_logged_signal["time"] is not None:
+        delta = (now - last_logged_signal["time"]).total_seconds()
+        last_action = last_logged_signal["action"]
+        last_score = last_logged_signal.get("score", 0)
+        last_price = last_logged_signal.get("price", 0)
+
+        if delta < MIN_ANY_INTERVAL and score < EXTREME_SCORE:
+            print(f"⏳ {action.upper()} ({score}) заблокирован: прошло {int(delta)}с")
+            return
+
+        if last_price > 0 and score < EXTREME_SCORE:
+            price_move_pct = abs(price - last_price) / last_price * 100
+            if price_move_pct < MIN_PRICE_MOVE_PCT:
+                print(f"⏳ {action.upper()} ({score}) заблокирован: цена сдвинулась {price_move_pct:.3f}%")
+                return
+
+    reason = state.get('signal', {}).get('reason', '')
+    strength = state.get('signal', {}).get('strength', 'none')
+    rsi = state.get('rsi', {}).get('value', 0)
+    pressure = state.get('pressure', {}).get('pressure', '—')
+    impulse = state.get('impulse', {}).get('impulse', '—')
+    trend = state.get('structure', {}).get('trend', '—')
+    choch = state.get('choch', {}).get('detected', False)
+
+    plan = state.get('signal', {}).get('trade_plan') or {}
+    stop_loss = plan.get('stop_loss')
+    take_profit = plan.get('take_profit')
+    rr = plan.get('risk_reward')
+
+    rsi_str = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "—"
+
+    with open(SIGNALS_FILE, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow([
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%H:%M:%S"),
+            symbol,
+            profile,
+            action.upper(),
+            f"{price:.5f}",
+            f"{score}",
+            strength,
+            reason,
+            f"{stop_loss:.5f}" if stop_loss else "—",
+            f"{take_profit:.5f}" if take_profit else "—",
+            f"{rr:.2f}" if rr else "—",
+            rsi_str,
+            pressure,
+            impulse,
+            trend,
+            "ДА" if choch else "",
+        ])
+
+    last_logged_signal = {
+        "action": action,
+        "symbol": symbol,
+        "time": now,
+        "score": score,
+        "price": price,
+    }
+    print(f"📝 Записан сигнал: {action.upper()} {symbol} score={score} @ {price}")
+
+
+# ============================================================
+# АНАЛИЗ
+# ============================================================
+async def analyze_loop():
+    global last_state
+
+    symbol = state_holder["symbol"]
+    profile = detect_profile(symbol)
+    interval = detect_interval(symbol)
+
+    print(f"🔌 Подключаемся к TradingView: {symbol}")
+    print(f"📊 Профиль: {profile}, ТФ: {interval}m")
+
+    history = []
+    try:
+        async with OHLCV() as client:
+            bars = await client.get_historical_ohlcv(
+                exchange_symbol=symbol,
+                interval=interval,
+                bars_count=HISTORY_COUNT,
+            )
+            history = from_tradingview(bars)
+            print(f"✅ История загружена: {len(history)} свечей")
+    except Exception as e:
+        print(f"❌ Ошибка загрузки истории: {type(e).__name__}: {e}")
+        return
+
+    if not history:
+        print("❌ История пуста.")
+        return
+
+    candles_buffer = deque(history, maxlen=500)
+
+    async def run_analysis():
+        global last_state
+        while True:
+            try:
+                if len(candles_buffer) < 30:
+                    await asyncio.sleep(UPDATE_INTERVAL)
+                    continue
+
+                analyzer = MarketAnalyzer(
+                    list(candles_buffer),
+                    profile=profile,
+                    symbol=symbol,
+                    closed_only=True,
+                )
+                state = analyzer.get_state()
+                state['current_price'] = candles_buffer[-1]['close']
+                state['symbol'] = symbol
+
+                last_state = state
+
+                log_signal(state)
+
+                if clients:
+                    message = json.dumps(state)
+                    dead = set()
+                    for ws in clients:
+                        try:
+                            await ws.send_text(message)
+                        except Exception:
+                            dead.add(ws)
+                    clients.difference_update(dead)
+
+                sig = state['signal']['action']
+                score = state['signal'].get('score', 0)
+                reason = state['signal'].get('reason', '')[:70]
+                rsi_val = state['rsi'].get('value', '—')
+                print(f"📊 {sig} ({score}) | impulse={state['impulse']['impulse']} | "
+                      f"pressure={state['pressure']['pressure']} | RSI={rsi_val} | price={state['current_price']}")
+                if sig == 'wait':
+                    print(f"   ↳ {reason}")
+
+            except Exception as e:
+                print(f"❌ Ошибка анализа: {type(e).__name__}: {e}")
+
+            await asyncio.sleep(UPDATE_INTERVAL)
+
+    analysis_task = asyncio.create_task(run_analysis())
+
+    try:
+        async with OHLCV() as client:
+            async for bar in client.get_ohlcv(symbol, interval):
+                if state_holder["restart"].is_set():
+                    break
+                if bar and hasattr(bar, 'close'):
+                    new_candle = {
+                        'time': int(bar.timestamp),
+                        'open': float(bar.open),
+                        'high': float(bar.high),
+                        'low': float(bar.low),
+                        'close': float(bar.close),
+                    }
+                    candle_time = new_candle["time"]
+
+                    # Обновляем свечу, если TradingView прислал её повторно.
+                    existing_idx = next(
+                        (
+                            idx for idx, candle in enumerate(candles_buffer)
+                            if int(candle["time"]) == candle_time
+                        ),
+                        None,
+                    )
+
+                    if existing_idx is not None:
+                        candles_buffer[existing_idx] = new_candle
+                    elif candle_time > int(candles_buffer[-1]["time"]):
+                        candles_buffer.append(new_candle)
+                    # Не добавляем неизвестные свечи из прошлого.
+    except Exception as e:
+        print(f"❌ Ошибка потока: {type(e).__name__}: {e}")
+    finally:
+        analysis_task.cancel()
+
+
+async def supervisor_loop():
+    while True:
+        state_holder["restart"].clear()
+        task = asyncio.create_task(analyze_loop())
+
+        restart_task = asyncio.create_task(state_holder["restart"].wait())
+        done, pending = await asyncio.wait([task, restart_task], return_when=asyncio.FIRST_COMPLETED)
+
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        if restart_task in done:
+            print(f"🔄 Переключение на {state_holder['symbol']}")
+        elif task in done:
+            try:
+                task.result()
+            except Exception as e:
+                print(f"❌ Задача упала: {e}")
+            await asyncio.sleep(5)
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_csv()
+    task = asyncio.create_task(supervisor_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/")
+async def index():
+    with open("panel.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/api/symbol")
+async def get_symbol():
+    return {"symbol": state_holder["symbol"]}
+
+
+@app.post("/api/switch")
+async def switch_symbol(req: SwitchRequest):
+    old = state_holder["symbol"]
+    state_holder["symbol"] = req.symbol
+    print(f"🔄 Переключение: {old} → {req.symbol}")
+    state_holder["restart"].set()
+    return {"ok": True, "symbol": req.symbol}
+
+
+@app.get("/api/signals.csv")
+async def download_signals():
+    if not os.path.exists(SIGNALS_FILE):
+        init_csv()
+    now = datetime.now(timezone.utc)
+    filename = f"signals_{now.strftime('%Y%m%d_%H%M')}_GMT.csv"
+    return FileResponse(path=SIGNALS_FILE, media_type="text/csv", filename=filename)
+
+
+@app.post("/api/clear-signals")
+async def clear_signals():
+    if os.path.exists(SIGNALS_FILE):
+        os.remove(SIGNALS_FILE)
+    init_csv()
+    return {"ok": True}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    print(f"🟢 Клиент подключился. Всего: {len(clients)}")
+
+    if last_state:
+        await ws.send_text(json.dumps(last_state))
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        clients.discard(ws)
+        print(f"🔴 Клиент отключился. Всего: {len(clients)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

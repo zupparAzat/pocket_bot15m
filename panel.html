@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Market Panel</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: rgba(15, 18, 25, 0.9);
+    color: #e8eaf0;
+    padding: 16px;
+    min-width: 360px;
+    backdrop-filter: blur(12px);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .symbol { font-size: 14px; font-weight: 600; letter-spacing: 0.5px; }
+  .price  { font-size: 20px; font-weight: 700; color: #4ade80; font-variant-numeric: tabular-nums; }
+  .status { font-size: 10px; color: #6b7280; text-align: right; }
+  .status.online { color: #4ade80; }
+  .status.offline { color: #ef4444; }
+
+  .signal-box {
+    padding: 14px;
+    border-radius: 10px;
+    margin-bottom: 14px;
+    text-align: center;
+    border: 2px solid transparent;
+    transition: all 0.3s;
+  }
+  .signal-box.long  { background: rgba(74, 222, 128, 0.15); border-color: #4ade80; }
+  .signal-box.short { background: rgba(239, 68, 68, 0.15);  border-color: #ef4444; }
+  .signal-box.wait  { background: rgba(107, 114, 128, 0.15); border-color: #6b7280; }
+
+  .signal-action {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .signal-box.long  .signal-action { color: #4ade80; }
+  .signal-box.short .signal-action { color: #ef4444; }
+  .signal-box.wait  .signal-action { color: #9ca3af; }
+
+  .signal-score {
+    font-size: 12px;
+    color: #9ca3af;
+    margin: 4px 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .signal-reason {
+    font-size: 11px;
+    color: #9ca3af;
+    line-height: 1.4;
+  }
+
+  /* План сделки */
+  .trade-plan {
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .trade-plan-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #6b7280;
+    margin-bottom: 8px;
+  }
+  .trade-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    padding: 4px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .trade-row .label { color: #6b7280; }
+  .trade-row .value { font-weight: 600; }
+  .trade-row.entry .value { color: #e8eaf0; }
+  .trade-row.stop  .value { color: #ef4444; }
+  .trade-row.take  .value { color: #4ade80; }
+  .trade-row.rr    .value { color: #fbbf24; }
+
+  .block { margin-bottom: 14px; }
+  .block-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #6b7280;
+    margin-bottom: 6px;
+  }
+
+  .assets-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+  }
+  .asset-btn {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #9ca3af;
+    font-size: 11px;
+    padding: 8px 4px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: center;
+  }
+  .asset-btn:hover {
+    background: rgba(74, 222, 128, 0.15);
+    color: #4ade80;
+    border-color: #4ade80;
+  }
+  .asset-btn.active {
+    background: rgba(74, 222, 128, 0.25);
+    color: #4ade80;
+    border-color: #4ade80;
+    font-weight: 700;
+  }
+
+  .trend-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .trend-badge.uptrend   { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+  .trend-badge.downtrend { background: rgba(239, 68, 68, 0.2);  color: #ef4444; }
+  .trend-badge.sideways  { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+
+  .choch-alert {
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 6px;
+  }
+  .choch-alert.up   { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+  .choch-alert.down { background: rgba(239, 68, 68, 0.2);  color: #ef4444; }
+
+  .divergence-alert {
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 6px;
+  }
+  .divergence-alert.bullish { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+  .divergence-alert.bearish { background: rgba(239, 68, 68, 0.2);  color: #ef4444; }
+
+  .level {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    padding: 3px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .level.resistance { color: #f87171; }
+  .level.support    { color: #4ade80; }
+
+  .pressure-bar {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+    margin: 6px 0;
+  }
+  .pressure-fill {
+    height: 100%;
+    transition: width 0.5s ease;
+    background: linear-gradient(90deg, #ef4444 0%, #6b7280 50%, #4ade80 100%);
+  }
+  .pressure-marker {
+    position: absolute;
+    top: -2px;
+    width: 2px;
+    height: 12px;
+    background: #fff;
+    transition: left 0.5s ease;
+  }
+  .pressure-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #6b7280;
+  }
+
+  .rsi-bar {
+    height: 8px;
+    background: linear-gradient(90deg, #4ade80 0%, #6b7280 30%, #6b7280 70%, #ef4444 100%);
+    border-radius: 4px;
+    position: relative;
+    margin: 6px 0;
+  }
+  .rsi-marker {
+    position: absolute;
+    top: -3px;
+    width: 3px;
+    height: 14px;
+    background: #fff;
+    border-radius: 2px;
+    transition: left 0.5s ease;
+  }
+  .rsi-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #6b7280;
+  }
+
+  .badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .badge.strong   { background: #4ade80; color: #0f1219; }
+  .badge.medium   { background: #fbbf24; color: #0f1219; }
+  .badge.weak     { background: #6b7280; color: #e8eaf0; }
+  .badge.none     { background: #374151; color: #9ca3af; }
+  .badge.up       { background: #22c55e; color: #0f1219; }
+  .badge.down     { background: #ef4444; color: #fff; }
+  .badge.buyers   { background: #4ade80; color: #0f1219; }
+  .badge.sellers  { background: #ef4444; color: #fff; }
+  .badge.balance  { background: #6b7280; color: #e8eaf0; }
+  .badge.overbought { background: #ef4444; color: #fff; }
+  .badge.oversold   { background: #4ade80; color: #0f1219; }
+  .badge.neutral    { background: #6b7280; color: #e8eaf0; }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+
+  .history-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    padding: 6px 8px;
+    border-radius: 5px;
+    margin-bottom: 4px;
+    background: rgba(255, 255, 255, 0.04);
+    border-left: 3px solid #6b7280;
+  }
+  .history-item.long  { border-left-color: #4ade80; }
+  .history-item.short { border-left-color: #ef4444; }
+
+  .history-action {
+    font-weight: 700;
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+  .history-item.long  .history-action { color: #4ade80; }
+  .history-item.short .history-action { color: #ef4444; }
+
+  .history-meta {
+    font-size: 10px;
+    color: #6b7280;
+    text-align: right;
+  }
+
+  .history-empty {
+    font-size: 11px;
+    color: #6b7280;
+    text-align: center;
+    padding: 8px;
+  }
+
+  .btn-clear {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #9ca3af;
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  .btn-clear:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #e8eaf0;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="symbol" id="symbol">—</div>
+    <div class="status" id="status">подключение...</div>
+  </div>
+  <div class="price" id="price">—</div>
+</div>
+
+<!-- АКТИВЫ -->
+<div class="block">
+  <div class="block-title">Актив</div>
+  <div class="assets-grid">
+    <button class="asset-btn" data-symbol="FX:EURUSD" onclick="switchAsset(this)">EURUSD</button>
+    <button class="asset-btn" data-symbol="FX:GBPUSD" onclick="switchAsset(this)">GBPUSD</button>
+    <button class="asset-btn" data-symbol="FX:USDJPY" onclick="switchAsset(this)">USDJPY</button>
+  </div>
+</div>
+
+<!-- СИГНАЛ -->
+<div class="signal-box wait" id="signal-box">
+  <div class="signal-action" id="signal-action">ЖДАТЬ</div>
+  <div class="signal-score" id="signal-score">score: 0</div>
+  <div class="signal-reason" id="signal-reason">нет данных</div>
+</div>
+
+<!-- ПЛАН СДЕЛКИ -->
+<div class="trade-plan" id="trade-plan" style="display: none;">
+  <div class="trade-plan-title">План сделки</div>
+  <div class="trade-row entry">
+    <span class="label">Вход</span>
+    <span class="value" id="tp-entry">—</span>
+  </div>
+  <div class="trade-row stop">
+    <span class="label">Стоп-лосс</span>
+    <span class="value" id="tp-stop">—</span>
+  </div>
+  <div class="trade-row take">
+    <span class="label">Тейк-профит</span>
+    <span class="value" id="tp-take">—</span>
+  </div>
+  <div class="trade-row rr">
+    <span class="label">Risk / Reward</span>
+    <span class="value" id="tp-rr">—</span>
+  </div>
+</div>
+
+<!-- ТРЕНД + CHoCH + ДИВЕРГЕНЦИЯ -->
+<div class="block">
+  <div class="block-title">Тренд и структура</div>
+  <span class="trend-badge sideways" id="trend-badge">sideways</span>
+  <div id="choch-alert"></div>
+  <div id="divergence-alert"></div>
+</div>
+
+<!-- УРОВНИ -->
+<div class="block">
+  <div class="block-title">Уровни</div>
+  <div id="resistance-list"></div>
+  <div id="support-list"></div>
+</div>
+
+<!-- ДАВЛЕНИЕ -->
+<div class="block">
+  <div class="block-title">Давление</div>
+  <div class="pressure-bar">
+    <div class="pressure-fill" id="pressure-fill" style="width: 50%"></div>
+    <div class="pressure-marker" id="pressure-marker" style="left: 50%"></div>
+  </div>
+  <div class="pressure-labels">
+    <span>Продавцы</span>
+    <span id="pressure-badge" class="badge balance">balance</span>
+    <span>Покупатели</span>
+  </div>
+</div>
+
+<!-- RSI -->
+<div class="block">
+  <div class="block-title">RSI</div>
+  <div class="rsi-bar">
+    <div class="rsi-marker" id="rsi-marker" style="left: 50%"></div>
+  </div>
+  <div class="rsi-labels">
+    <span>0</span>
+    <span id="rsi-badge" class="badge neutral">50</span>
+    <span>100</span>
+  </div>
+</div>
+
+<!-- ИМПУЛЬС -->
+<div class="block">
+  <div class="block-title">Импульс</div>
+  <div class="row">
+    <span id="impulse-badge" class="badge weak">weak</span>
+    <span id="impulse-dir" class="badge up">up</span>
+    <span id="roc" style="font-size: 11px; color: #9ca3af;">ROC: —</span>
+  </div>
+</div>
+
+<!-- ИСТОРИЯ -->
+<div class="block">
+  <div class="block-title" style="display: flex; justify-content: space-between; align-items: center;">
+    <span>История сигналов</span>
+    <div style="display: flex; gap: 5px;">
+      <button class="btn-clear" onclick="downloadCSV()">📥 Excel</button>
+      <button class="btn-clear" onclick="clearCSV()">🗑 CSV</button>
+      <button class="btn-clear" onclick="clearHistory()">очистить</button>
+    </div>
+  </div>
+  <div id="history-list"></div>
+  <div style="font-size: 9px; color: #4b5563; margin-top: 6px; text-align: center;">
+    время сигналов — GMT (как в Libertex) · таймфрейм 1H
+  </div>
+</div>
+
+<script>
+const statusEl   = document.getElementById('status');
+const symbolEl   = document.getElementById('symbol');
+const priceEl    = document.getElementById('price');
+
+let ws = null;
+let reconnectTimer = null;
+let lastSignalAction = null;
+let currentSymbol = null;
+
+// ============================================================
+// ЗВУК
+// ============================================================
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playTone(freq, duration) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playAlert(type) {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (type === 'long') {
+    playTone(880, 0.15);
+    setTimeout(() => playTone(1100, 0.2), 150);
+  } else if (type === 'short') {
+    playTone(440, 0.15);
+    setTimeout(() => playTone(330, 0.2), 150);
+  } else if (type === 'choch') {
+    playTone(700, 0.1);
+    setTimeout(() => playTone(700, 0.1), 120);
+    setTimeout(() => playTone(700, 0.1), 240);
+  }
+}
+
+// ============================================================
+// ПЕРЕКЛЮЧЕНИЕ АКТИВОВ
+// ============================================================
+async function switchAsset(btn) {
+  const symbol = btn.dataset.symbol;
+  if (symbol === currentSymbol) return;
+
+  try {
+    const res = await fetch('/api/switch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol: symbol})
+    });
+    const data = await res.json();
+    if (data.ok) {
+      currentSymbol = symbol;
+      document.querySelectorAll('.asset-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+
+      document.getElementById('resistance-list').innerHTML = '';
+      document.getElementById('support-list').innerHTML = '';
+      document.getElementById('signal-action').textContent = 'ЗАГРУЗКА...';
+      document.getElementById('signal-reason').textContent = 'ожидание данных';
+      document.getElementById('trade-plan').style.display = 'none';
+
+      lastSignalAction = null;
+    }
+  } catch (e) {
+    console.error('Ошибка переключения:', e);
+  }
+}
+
+// ============================================================
+// CSV
+// ============================================================
+function downloadCSV() {
+  window.location.href = '/api/signals.csv';
+}
+
+async function clearCSV() {
+  if (!confirm('Очистить CSV-файл на сервере?')) return;
+  try {
+    await fetch('/api/clear-signals', {method: 'POST'});
+    alert('CSV очищен');
+  } catch (e) {
+    alert('Ошибка: ' + e);
+  }
+}
+
+// ============================================================
+// ИСТОРИЯ СИГНАЛОВ
+// ============================================================
+const HISTORY_KEY = 'market_panel_history';
+const MAX_HISTORY = 50;
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) { return []; }
+}
+
+function saveHistory(history) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY)));
+  } catch (e) {}
+}
+
+function addToHistory(state) {
+  const history = loadHistory();
+  const action = state.signal?.action || 'wait';
+  const reason = state.signal?.reason || '';
+  const price = state.current_price || 0;
+  const symbol = state.symbol || '—';
+  const score = state.signal?.score || 0;
+
+  const now = new Date();
+  const gmt = new Date(now.getTime() + now.getTimezoneOffset() * 60000);
+
+  history.unshift({
+    action, reason, price, symbol, score,
+    time: gmt.toISOString(),
+    timeStr: gmt.toISOString().substr(11, 8) + ' GMT',
+  });
+
+  saveHistory(history);
+  renderHistory();
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderHistory() {
+  const history = loadHistory();
+  const list = document.getElementById('history-list');
+
+  if (!history.length) {
+    list.innerHTML = '<div class="history-empty">пока нет сигналов</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  history.slice(0, 10).forEach(item => {
+    const div = document.createElement('div');
+    div.className = 'history-item ' + item.action;
+
+    const actionLabel = item.action === 'long' ? '🟢 LONG' :
+                        item.action === 'short' ? '🔴 SHORT' : '⚪ WAIT';
+
+    const timeStr = item.timeStr || '—';
+
+    div.innerHTML = `
+      <div>
+        <div class="history-action">${actionLabel} <span style="color:#6b7280;font-weight:400;">${escapeHtml(item.symbol)}</span></div>
+        <div style="font-size:10px;color:#6b7280;">score ${item.score || 0} · ${escapeHtml(item.reason.slice(0, 30))}</div>
+      </div>
+      <div class="history-meta">
+        <div>${Number(item.price).toFixed(5)}</div>
+        <div>${timeStr}</div>
+      </div>
+    `;
+    list.appendChild(div);
+  });
+}
+
+function clearHistory() {
+  localStorage.removeItem(HISTORY_KEY);
+  renderHistory();
+}
+
+// ============================================================
+// WEBSOCKET
+// ============================================================
+function connect() {
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+
+  ws.onopen = () => {
+    statusEl.textContent = '🟢 онлайн';
+    statusEl.className = 'status online';
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = '🔴 офлайн';
+    statusEl.className = 'status offline';
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {
+    statusEl.textContent = '⚠️ ошибка';
+    statusEl.className = 'status offline';
+  };
+
+  ws.onmessage = (event) => {
+    const state = JSON.parse(event.data);
+    render(state);
+  };
+}
+
+function render(state) {
+  symbolEl.textContent = state.symbol || '—';
+  if (state.current_price) {
+    priceEl.textContent = Number(state.current_price).toFixed(5);
+  }
+
+  // СИГНАЛ
+  const sigBox = document.getElementById('signal-box');
+  const sigAction = document.getElementById('signal-action');
+  const sigReason = document.getElementById('signal-reason');
+  const scoreEl = document.getElementById('signal-score');
+
+  const action = state.signal?.action || 'wait';
+  const score = state.signal?.score ?? 0;
+  const strength = state.signal?.strength || 'none';
+
+  sigBox.className = 'signal-box ' + action;
+  sigAction.textContent = action === 'long' ? '🟢 LONG' :
+                          action === 'short' ? '🔴 SHORT' : '⚪ ЖДАТЬ';
+  sigReason.textContent = state.signal?.reason || '—';
+
+  scoreEl.textContent = `score: ${score} (${strength})`;
+  if (score >= 80) scoreEl.style.color = '#4ade80';
+  else if (score >= 60) scoreEl.style.color = '#fbbf24';
+  else if (score >= 40) scoreEl.style.color = '#9ca3af';
+  else scoreEl.style.color = '#4b5563';
+
+  // ПЛАН СДЕЛКИ
+  const planDiv = document.getElementById('trade-plan');
+  const plan = state.signal?.trade_plan;
+
+  if (plan && action !== 'wait') {
+    planDiv.style.display = 'block';
+    document.getElementById('tp-entry').textContent = Number(plan.entry).toFixed(5);
+    document.getElementById('tp-stop').textContent = `${Number(plan.stop_loss).toFixed(5)} (−${plan.risk_pips} п.)`;
+    document.getElementById('tp-take').textContent = `${Number(plan.take_profit).toFixed(5)} (+${plan.reward_pips} п.)`;
+    document.getElementById('tp-rr').textContent = `1 : ${plan.risk_reward}`;
+  } else {
+    planDiv.style.display = 'none';
+  }
+
+  // Звук + история
+  if (action !== lastSignalAction && action !== 'wait') {
+    playAlert(action);
+    addToHistory(state);
+  }
+  lastSignalAction = action;
+
+  if (state.choch?.detected) {
+    playAlert('choch');
+  }
+
+  // ТРЕНД
+  const trend = state.structure?.trend || 'sideways';
+  const trendBadge = document.getElementById('trend-badge');
+  trendBadge.textContent = trend;
+  trendBadge.className = 'trend-badge ' + trend;
+
+  // CHoCH
+  const chochDiv = document.getElementById('choch-alert');
+  if (state.choch?.detected) {
+    chochDiv.innerHTML = `<div class="choch-alert ${state.choch.direction}">
+      ⚠️ CHoCH ${state.choch.direction.toUpperCase()}: пробит уровень ${state.choch.level}
+    </div>`;
+  } else {
+    chochDiv.innerHTML = '';
+  }
+
+  // ДИВЕРГЕНЦИЯ
+  const divDiv = document.getElementById('divergence-alert');
+  const divergence = state.divergence;
+  if (divergence?.divergence) {
+    const label = divergence.divergence === 'bullish' ? '🟢 BULLISH' : '🔴 BEARISH';
+    divDiv.innerHTML = `<div class="divergence-alert ${divergence.divergence}">
+      ${label} divergence (${divergence.strength}): RSI diff ${divergence.rsi_diff}
+    </div>`;
+  } else {
+    divDiv.innerHTML = '';
+  }
+
+  // УРОВНИ
+  const resList = document.getElementById('resistance-list');
+  const supList = document.getElementById('support-list');
+  resList.innerHTML = '';
+  supList.innerHTML = '';
+
+  const resistances = (state.levels?.resistances || []).slice().reverse();
+  const supports    = (state.levels?.supports || []).slice().reverse();
+
+  resistances.forEach(r => {
+    const div = document.createElement('div');
+    div.className = 'level resistance';
+    div.innerHTML = `<span>R</span><span>${Number(r).toFixed(5)}</span>`;
+    resList.appendChild(div);
+  });
+
+  supports.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'level support';
+    div.innerHTML = `<span>S</span><span>${Number(s).toFixed(5)}</span>`;
+    supList.appendChild(div);
+  });
+
+  // ДАВЛЕНИЕ
+  const ratio = state.pressure?.buyer_ratio ?? 0.5;
+  document.getElementById('pressure-fill').style.width = (ratio * 100) + '%';
+  document.getElementById('pressure-marker').style.left = (ratio * 100) + '%';
+
+  const pBadge = document.getElementById('pressure-badge');
+  pBadge.textContent = state.pressure?.pressure || 'balance';
+  pBadge.className = 'badge ' + (state.pressure?.pressure || 'balance');
+
+  // RSI
+  const rsiVal = state.rsi?.value ?? 50;
+  const rsiZone = state.rsi?.zone || 'neutral';
+  document.getElementById('rsi-marker').style.left = rsiVal + '%';
+  const rsiBadge = document.getElementById('rsi-badge');
+  rsiBadge.textContent = rsiVal.toFixed(1) + ' ' + rsiZone;
+  rsiBadge.className = 'badge ' + rsiZone;
+
+  // ИМПУЛЬС
+  const impBadge = document.getElementById('impulse-badge');
+  impBadge.textContent = state.impulse?.impulse || 'weak';
+  impBadge.className = 'badge ' + (state.impulse?.impulse || 'weak');
+
+  const dirBadge = document.getElementById('impulse-dir');
+  dirBadge.textContent = state.impulse?.direction || '—';
+  dirBadge.className = 'badge ' + (state.impulse?.direction || 'up');
+
+  document.getElementById('roc').textContent =
+    'ROC: ' + (state.impulse?.roc_percent?.toFixed(3) ?? '—') + '%';
+}
+
+document.addEventListener('click', () => {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}, { once: true });
+
+window.addEventListener('load', () => {
+  const defaultBtn = document.querySelector('[data-symbol="FX:EURUSD"]');
+  if (defaultBtn) {
+    defaultBtn.classList.add('active');
+    currentSymbol = 'FX:EURUSD';
+  }
+  renderHistory();
+  connect();
+});
+</script>
+
+</body>
+</html>

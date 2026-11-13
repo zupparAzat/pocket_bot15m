@@ -1,0 +1,646 @@
+import pandas as pd
+import numpy as np
+from scipy.signal import argrelextrema
+
+
+# ============================================================
+# ПРОФИЛЬ ТОЛЬКО ДЛЯ ФОРЕКСА
+# ============================================================
+PROFILES = {
+    "forex": {
+        "rsi_period": 14,
+        "rsi_overbought": 70,
+        "rsi_oversold": 30,
+        "impulse_threshold": 1.05,
+        "pressure_period": 10,
+        "min_candles": 50,
+    },
+}
+
+
+def detect_profile(symbol: str = "") -> str:
+    return "forex"
+
+
+def detect_interval(symbol: str = "") -> str:
+    return "15"
+
+
+class MarketAnalyzer:
+    """Анализ рынка Forex и формирование сигналов LONG/SHORT/WAIT."""
+
+    def __init__(
+        self,
+        candles: list,
+        profile: str = "forex",
+        symbol: str = "EURUSD",
+        closed_only: bool = False,
+    ):
+        if not candles:
+            raise ValueError("Пустой список свечей")
+
+        self.profile_name = profile if profile in PROFILES else "forex"
+        self.params = PROFILES[self.profile_name]
+        self.symbol = symbol
+        self.pip_size = 0.01 if "JPY" in symbol.upper() else 0.0001
+
+        df = pd.DataFrame(candles)
+
+        required = {"open", "high", "low", "close"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Нет колонок: {sorted(missing)}")
+
+        for col in ("open", "high", "low", "close"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        time_col = "time" if "time" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+
+        if time_col:
+            raw = df[time_col]
+            if pd.api.types.is_numeric_dtype(raw):
+                numeric = pd.to_numeric(raw, errors="coerce")
+                non_null = numeric.dropna()
+                if not non_null.empty:
+                    unit = "ms" if non_null.abs().median() > 1e11 else "s"
+                    df["_time"] = pd.to_datetime(numeric, unit=unit, errors="coerce", utc=True)
+            else:
+                df["_time"] = pd.to_datetime(raw, errors="coerce", utc=True)
+
+            if "_time" in df.columns and df["_time"].notna().any():
+                df = df.sort_values("_time", kind="stable")
+                df = df.drop_duplicates("_time", keep="last")
+
+        valid = (
+            df[["open", "high", "low", "close"]].notna().all(axis=1)
+            & (df["high"] >= df[["open", "close", "low"]].max(axis=1))
+            & (df["low"] <= df[["open", "close", "high"]].min(axis=1))
+            & (df[["open", "high", "low", "close"]] > 0).all(axis=1)
+        )
+        df = df.loc[valid].copy().reset_index(drop=True)
+
+        if closed_only and len(df) > 1:
+            df = df.iloc[:-1].copy().reset_index(drop=True)
+
+        if df.empty:
+            raise ValueError("После проверки не осталось корректных свечей")
+
+        self.df = df
+
+        self.validation = {
+            "valid": True,
+            "candles": len(df),
+            "minimum_required": self.params["min_candles"],
+            "warnings": [],
+        }
+
+        if len(df) < self.params["min_candles"]:
+            self.validation["warnings"].append(
+                f"Мало свечей: {len(df)}. Рекомендуется не менее {self.params['min_candles']}"
+            )
+
+    # ============================================================
+    # ATR (Уайлдер)
+    # ============================================================
+    def _atr_series(self, period: int = 14) -> pd.Series:
+        high = self.df["high"]
+        low = self.df["low"]
+        close = self.df["close"]
+        previous_close = close.shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ], axis=1).max(axis=1)
+
+        return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    # ============================================================
+    # RSI (Уайлдер)
+    # ============================================================
+    def _rsi_series(self, period: int = None) -> pd.Series:
+        period = period or self.params["rsi_period"]
+        delta = self.df["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+
+        rsi = rsi.where(avg_loss.ne(0), 100.0)
+        rsi = rsi.where(avg_gain.ne(0), 0.0)
+        both_zero = avg_gain.eq(0) & avg_loss.eq(0)
+        return rsi.where(~both_zero, 50.0)
+
+    def calc_rsi(self, period: int = None) -> dict:
+        period = period or self.params["rsi_period"]
+        if len(self.df) < period + 1:
+            return {"value": None, "zone": "neutral"}
+
+        value = self._rsi_series(period).iloc[-1]
+        if pd.isna(value):
+            return {"value": None, "zone": "neutral"}
+
+        value = float(value)
+
+        if value >= self.params["rsi_overbought"]:
+            zone = "overbought"
+        elif value <= self.params["rsi_oversold"]:
+            zone = "oversold"
+        else:
+            zone = "neutral"
+
+        return {"value": round(value, 1), "zone": zone}
+
+    # ============================================================
+    # Подтверждённые swing-точки
+    # ============================================================
+    def _swings(self, order: int = 5):
+        if order < 1:
+            order = 1
+
+        highs = self.df["high"].to_numpy()
+        lows = self.df["low"].to_numpy()
+
+        high_swings = []
+        low_swings = []
+
+        for i in range(order, len(self.df) - order):
+            left_highs = highs[i - order:i]
+            right_highs = highs[i + 1:i + order + 1]
+            left_lows = lows[i - order:i]
+            right_lows = lows[i + 1:i + order + 1]
+
+            if highs[i] > np.max(left_highs) and highs[i] >= np.max(right_highs):
+                high_swings.append({"index": i, "price": float(highs[i])})
+
+            if lows[i] < np.min(left_lows) and lows[i] <= np.min(right_lows):
+                low_swings.append({"index": i, "price": float(lows[i])})
+
+        return high_swings, low_swings
+
+    # ============================================================
+    # Уровни
+    # ============================================================
+    def find_levels(self, order: int = 5) -> dict:
+        if len(self.df) < order * 2 + 1:
+            return {"resistances": [], "supports": [], "swing_highs": [], "swing_lows": []}
+
+        highs, lows = self._swings(order)
+        price = float(self.df["close"].iloc[-1])
+
+        resistances = sorted({round(x["price"], 8) for x in highs if x["price"] > price})
+        supports = sorted({round(x["price"], 8) for x in lows if x["price"] < price}, reverse=True)
+
+        return {
+            "resistances": resistances[:5],
+            "supports": supports[:5],
+            "swing_highs": highs[-5:],
+            "swing_lows": lows[-5:],
+        }
+
+    # ============================================================
+    # Импульс
+    # ============================================================
+    def calc_impulse(self, period: int = 14) -> dict:
+        if len(self.df) < period + 1:
+            return {"atr": None, "roc_percent": None, "impulse": "unknown", "direction": "flat"}
+
+        atr_series = self._atr_series(period)
+        atr_value = atr_series.iloc[-1]
+
+        if pd.isna(atr_value):
+            return {"atr": None, "roc_percent": None, "impulse": "unknown", "direction": "flat"}
+
+        atr = float(atr_value)
+
+        tr = pd.concat([
+            self.df["high"] - self.df["low"],
+            (self.df["high"] - self.df["close"].shift(1)).abs(),
+            (self.df["low"] - self.df["close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+
+        atr_average = tr.rolling(period * 2, min_periods=period).mean().iloc[-1]
+
+        old_close = float(self.df["close"].iloc[-period - 1])
+        close = float(self.df["close"].iloc[-1])
+        roc = ((close - old_close) / old_close * 100) if old_close != 0 else 0.0
+
+        if roc > 0:
+            direction = "up"
+        elif roc < 0:
+            direction = "down"
+        else:
+            direction = "flat"
+
+        strong = (
+            pd.notna(atr_average)
+            and atr > 0
+            and float(atr_average) > 0
+            and atr > float(atr_average) * self.params["impulse_threshold"]
+        )
+
+        return {
+            "atr": round(atr, 8),
+            "roc_percent": round(roc, 4),
+            "impulse": "strong" if strong else "weak",
+            "direction": direction,
+        }
+
+    # ============================================================
+    # Давление
+    # ============================================================
+    def calc_pressure(self, period: int = None) -> dict:
+        period = min(period or self.params["pressure_period"], len(self.df))
+        df = self.df.tail(period)
+
+        candle_range = (df["high"] - df["low"]).replace(0, np.nan)
+        close_position = ((df["close"] - df["low"]) / candle_range).fillna(0.5)
+
+        ratio = float(close_position.mean()) if len(close_position) else 0.5
+
+        if ratio > 0.60:
+            pressure = "buyers"
+        elif ratio < 0.40:
+            pressure = "sellers"
+        else:
+            pressure = "balance"
+
+        return {
+            "pressure": pressure,
+            "buyer_ratio": round(ratio, 3),
+            "bullish_candles": int((df["close"] > df["open"]).sum()),
+            "bearish_candles": int((df["close"] < df["open"]).sum()),
+        }
+
+    # ============================================================
+    # Дивергенция RSI
+    # ============================================================
+    def detect_rsi_divergence(self, order: int = 5) -> dict:
+        if len(self.df) < max(order * 4 + 1, self.params["rsi_period"] + order + 2):
+            return {"divergence": None, "strength": "none"}
+
+        rsi = self._rsi_series().to_numpy()
+        highs, lows = self._swings(order)
+
+        price_highs = [x for x in highs if np.isfinite(rsi[x["index"]])]
+        price_lows = [x for x in lows if np.isfinite(rsi[x["index"]])]
+
+        if len(price_highs) >= 2:
+            first, second = price_highs[-2:]
+            price_diff = second["price"] - first["price"]
+            rsi_diff = float(rsi[second["index"]] - rsi[first["index"]])
+
+            if price_diff > 0 and rsi_diff < 0:
+                return {
+                    "divergence": "bearish",
+                    "strength": "strong" if abs(rsi_diff) >= 10 else "weak",
+                    "price_diff": round(price_diff, 8),
+                    "rsi_diff": round(abs(rsi_diff), 1),
+                }
+
+        if len(price_lows) >= 2:
+            first, second = price_lows[-2:]
+            price_diff = second["price"] - first["price"]
+            rsi_diff = float(rsi[second["index"]] - rsi[first["index"]])
+
+            if price_diff < 0 and rsi_diff > 0:
+                return {
+                    "divergence": "bullish",
+                    "strength": "strong" if abs(rsi_diff) >= 10 else "weak",
+                    "price_diff": round(abs(price_diff), 8),
+                    "rsi_diff": round(abs(rsi_diff), 1),
+                }
+
+        return {"divergence": None, "strength": "none"}
+
+    # ============================================================
+    # Структура рынка
+    # ============================================================
+    def detect_structure(self, order: int = 5) -> dict:
+        highs, lows = self._swings(order)
+
+        result = {
+            "trend": "sideways",
+            "HH": None, "HL": None,
+            "LH": None, "LL": None,
+            "last_highs": [x["price"] for x in highs[-2:]],
+            "last_lows": [x["price"] for x in lows[-2:]],
+            "swing_highs": highs[-5:],
+            "swing_lows": lows[-5:],
+        }
+
+        if len(highs) < 2 or len(lows) < 2:
+            return result
+
+        previous_high = highs[-2]["price"]
+        current_high = highs[-1]["price"]
+        previous_low = lows[-2]["price"]
+        current_low = lows[-1]["price"]
+
+        if current_high > previous_high and current_low > previous_low:
+            result.update(trend="uptrend", HH=current_high, HL=current_low)
+        elif current_high < previous_high and current_low < previous_low:
+            result.update(trend="downtrend", LH=current_high, LL=current_low)
+
+        return result
+
+    # ============================================================
+    # CHoCH
+    # ============================================================
+    def detect_choch(self, structure: dict) -> dict:
+        if len(self.df) < 2:
+            return {"detected": False, "direction": None, "level": None}
+
+        close = float(self.df["close"].iloc[-1])
+        previous_close = float(self.df["close"].iloc[-2])
+        trend = structure.get("trend", "sideways")
+
+        level = None
+        direction = None
+
+        if trend == "uptrend" and structure.get("HL") is not None:
+            level = float(structure["HL"])
+            if previous_close >= level and close < level:
+                direction = "down"
+        elif trend == "downtrend" and structure.get("LH") is not None:
+            level = float(structure["LH"])
+            if previous_close <= level and close > level:
+                direction = "up"
+
+        return {
+            "detected": direction is not None,
+            "direction": direction,
+            "level": level,
+        }
+
+    # ============================================================
+    # Торговый план — R:R 1:1.5
+    # ============================================================
+    def calc_trade_plan(self, action, price, atr, levels, structure=None):
+        if action not in ("long", "short"):
+            return None
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        structure = structure or {}
+        last_lows = structure.get("swing_lows", [])
+        last_highs = structure.get("swing_highs", [])
+        buffer = atr * 0.15
+
+        if action == "long":
+            candidates = [x["price"] for x in last_lows if x["price"] < price]
+            structural_stop = (max(candidates) if candidates else price - 1.5 * atr) - buffer
+            stop = min(structural_stop, price - 0.8 * atr)
+            risk = price - stop
+
+            if stop >= price or risk <= 0:
+                return None
+
+            targets = [x for x in levels.get("resistances", []) if x > price]
+            target_by_rr = price + risk * 1.5
+            target = min(targets[0], target_by_rr) if targets else target_by_rr
+
+            if target <= price:
+                return None
+
+            if (target - price) / risk < 1.3:
+                return None
+
+        else:
+            candidates = [x["price"] for x in last_highs if x["price"] > price]
+            structural_stop = (min(candidates) if candidates else price + 1.5 * atr) + buffer
+            stop = max(structural_stop, price + 0.8 * atr)
+            risk = stop - price
+
+            if stop <= price or risk <= 0:
+                return None
+
+            targets = [x for x in levels.get("supports", []) if x < price]
+            target_by_rr = price - risk * 1.5
+            target = max(targets[0], target_by_rr) if targets else target_by_rr
+
+            if target >= price:
+                return None
+
+            if (price - target) / risk < 1.3:
+                return None
+
+        reward = abs(target - price)
+
+        return {
+            "entry": round(price, 8),
+            "stop_loss": round(stop, 8),
+            "take_profit": round(target, 8),
+            "risk_pips": round(risk / self.pip_size, 1),
+            "reward_pips": round(reward / self.pip_size, 1),
+            "risk_reward": round(reward / risk, 2),
+            "pip_size": self.pip_size,
+        }
+
+    # ============================================================
+    # Формирование сигнала
+    # ============================================================
+    def make_signal(self, levels, impulse, pressure, rsi, structure, choch, divergence):
+        if len(self.df) < self.params["min_candles"]:
+            return self._wait(f"Недостаточно свечей: {len(self.df)} из {self.params['min_candles']}", 0)
+
+        price = float(self.df["close"].iloc[-1])
+        atr = impulse.get("atr")
+
+        if atr is None or not np.isfinite(atr) or atr <= 0:
+            return self._wait("ATR не рассчитан", 0)
+
+        supports = [x for x in levels.get("supports", []) if x < price]
+        resistances = [x for x in levels.get("resistances", []) if x > price]
+
+        nearest_support = max(supports) if supports else None
+        nearest_resistance = min(resistances) if resistances else None
+
+        near_distance = max(atr * 1.5, self.pip_size * 5)
+
+        near_support = nearest_support is not None and price - nearest_support <= near_distance
+        near_resistance = nearest_resistance is not None and nearest_resistance - price <= near_distance
+
+        trend = structure.get("trend", "sideways")
+        pressure_name = pressure.get("pressure", "balance")
+        ratio = float(pressure.get("buyer_ratio", 0.5))
+        rsi_value = rsi.get("value")
+
+        if rsi_value is None:
+            return self._wait("Нет RSI", 0)
+
+        rsi_value = float(rsi_value)
+        impulse_direction = impulse.get("direction", "flat")
+        impulse_strong = impulse.get("impulse") == "strong"
+        divergence_type = divergence.get("divergence")
+
+        candle = self.df.iloc[-1]
+        previous = self.df.iloc[-2]
+
+        bullish_close = candle["close"] > candle["open"] and candle["close"] > previous["close"]
+        bearish_close = candle["close"] < candle["open"] and candle["close"] < previous["close"]
+
+        long_score = 0
+        short_score = 0
+        long_reasons = []
+        short_reasons = []
+
+        if trend == "uptrend":
+            long_score += 25
+            long_reasons.append("восходящая структура")
+            short_score -= 25
+        elif trend == "downtrend":
+            short_score += 25
+            short_reasons.append("нисходящая структура")
+            long_score -= 25
+
+        if near_support:
+            long_score += 20
+            long_reasons.append("цена возле поддержки")
+
+        if near_resistance:
+            short_score += 20
+            short_reasons.append("цена возле сопротивления")
+
+        pressure_direction = pressure_name
+
+        if pressure_direction not in ("buyers", "sellers"):
+            if ratio > 0.60:
+                pressure_direction = "buyers"
+            elif ratio < 0.40:
+                pressure_direction = "sellers"
+            else:
+                pressure_direction = "balance"
+
+        if pressure_direction == "buyers":
+            long_score += 15
+            short_score -= 15
+            long_reasons.append("преимущество покупателей")
+            short_reasons.append("давление покупателей против SHORT")
+
+        elif pressure_direction == "sellers":
+            short_score += 15
+            long_score -= 15
+            short_reasons.append("преимущество продавцов")
+            long_reasons.append("давление продавцов против LONG")
+
+        if impulse_direction == "up":
+            long_score += 15 if impulse_strong else 8
+            long_reasons.append("сильный импульс вверх" if impulse_strong else "движение вверх")
+        elif impulse_direction == "down":
+            short_score += 15 if impulse_strong else 8
+            short_reasons.append("сильный импульс вниз" if impulse_strong else "движение вниз")
+
+        if 55 <= rsi_value <= 68:
+            long_score += 10
+            long_reasons.append(f"RSI {rsi_value} поддерживает LONG")
+
+        elif 32 <= rsi_value < 45:
+            short_score += 10
+            short_reasons.append(f"RSI {rsi_value} поддерживает SHORT")
+
+        if bullish_close:
+            long_score += 10
+            long_reasons.append("свеча подтвердила движение вверх")
+
+        if bearish_close:
+            short_score += 10
+            short_reasons.append("свеча подтвердила движение вниз")
+
+        if divergence_type == "bullish":
+            long_score += 10
+            long_reasons.append("бычья дивергенция")
+            short_score -= 10
+        elif divergence_type == "bearish":
+            short_score += 10
+            short_reasons.append("медвежья дивергенция")
+            long_score -= 10
+
+        if choch.get("detected"):
+            if choch.get("direction") == "up":
+                long_score += 15
+                long_reasons.append("пробой структурного уровня вверх")
+            elif choch.get("direction") == "down":
+                short_score += 15
+                short_reasons.append("пробой структурного уровня вниз")
+
+        candidates = []
+        min_score = 65
+
+        if trend != "downtrend" and long_score >= min_score:
+            candidates.append(("long", long_score, long_reasons))
+
+        if trend != "uptrend" and short_score >= min_score:
+            candidates.append(("short", short_score, short_reasons))
+
+        if not candidates:
+            score = max(long_score, short_score, 0)
+            return self._wait(f"LONG={long_score}, SHORT={short_score}", score, long_score, short_score)
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        action, score, reasons = candidates[0]
+
+        if len(candidates) > 1 and candidates[0][1] == candidates[1][1]:
+            return self._wait("Конфликт LONG/SHORT", score, long_score, short_score)
+
+        plan = self.calc_trade_plan(action, price, float(atr), levels, structure)
+
+        if plan is None:
+            return self._wait(f"{action.upper()} есть, но R:R < 1.3", score, long_score, short_score)
+
+        return {
+            "action": action,
+            "reason": f"{action.upper()} ({score}): " + ", ".join(reasons),
+            "color": "green" if action == "long" else "red",
+            "strength": "strong" if score >= 80 else "medium",
+            "score": int(score),
+            "long_score": int(long_score),
+            "short_score": int(short_score),
+            "trade_plan": plan,
+        }
+
+    @staticmethod
+    def _wait(reason, score=0, long_score=0, short_score=0):
+        return {
+            "action": "wait",
+            "reason": reason,
+            "color": "gray",
+            "strength": "none",
+            "score": int(score),
+            "long_score": int(long_score),
+            "short_score": int(short_score),
+            "trade_plan": None,
+        }
+
+    # ============================================================
+    # Полное состояние
+    # ============================================================
+    def get_state(self) -> dict:
+        levels = self.find_levels()
+        impulse = self.calc_impulse()
+        pressure = self.calc_pressure()
+        rsi = self.calc_rsi()
+        structure = self.detect_structure()
+        choch = self.detect_choch(structure)
+        divergence = self.detect_rsi_divergence()
+
+        signal = self.make_signal(levels, impulse, pressure, rsi, structure, choch, divergence)
+
+        return {
+            "levels": levels,
+            "impulse": impulse,
+            "pressure": pressure,
+            "rsi": rsi,
+            "structure": structure,
+            "choch": choch,
+            "divergence": divergence,
+            "signal": signal,
+            "profile": self.profile_name,
+            "symbol": self.symbol,
+            "validation": self.validation,
+        }

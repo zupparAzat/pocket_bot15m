@@ -1,0 +1,838 @@
+import asyncio
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from tvkit.api.chart.ohlcv import OHLCV
+
+from adapter import from_tradingview
+from logic import MarketAnalyzer
+
+
+SYMBOL = "FX:EURUSD"
+INTERVAL = "15"
+HISTORY_BARS = 2000
+WINDOW = 200
+STEP = 1
+MAX_HOLD_BARS = 24
+
+PIP_SIZE = 0.01 if "JPY" in SYMBOL.upper() else 0.0001
+
+
+CACHE_FILE = Path(__file__).with_name("backtest_candles_15m.json")
+INTERVAL_SECONDS = int(INTERVAL) * 60
+
+
+def remove_unclosed_candles(candles):
+    """Убирает незакрытые свечи с конца истории по UTC."""
+    result = list(candles)
+    now_timestamp = datetime.now(timezone.utc).timestamp()
+    removed = 0
+
+    while result:
+        try:
+            close_timestamp = int(result[-1]["time"]) + INTERVAL_SECONDS
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "Не удалось определить время закрытия последней свечи"
+            ) from exc
+
+        if close_timestamp <= now_timestamp:
+            break
+
+        result.pop()
+        removed += 1
+
+    if removed:
+        print(f"Исключено незакрытых свечей: {removed}")
+
+    return result
+
+
+async def fetch_history():
+    import os
+
+    refresh = os.getenv("BACKTEST_REFRESH") == "1"
+
+    if CACHE_FILE.exists() and not refresh:
+        candles = json.loads(CACHE_FILE.read_text())
+
+        if not isinstance(candles, list) or not candles:
+            raise ValueError(f"Кэш свечей пустой или поврежден: {CACHE_FILE}")
+
+        candles = remove_unclosed_candles(candles)
+
+        if len(candles) < WINDOW + 1:
+            raise ValueError(
+                f"Недостаточно закрытых свечей в кэше: {len(candles)}"
+            )
+
+        print(f"История загружена из кэша: {CACHE_FILE.name}")
+        return candles
+
+    print("Загружаю историю с TradingView...")
+
+    async with OHLCV() as client:
+        bars = await client.get_historical_ohlcv(
+            exchange_symbol=SYMBOL,
+            interval=INTERVAL,
+            bars_count=HISTORY_BARS,
+        )
+
+    candles = from_tradingview(bars)
+
+    if not isinstance(candles, list) or not candles:
+        raise ValueError("TradingView не вернул корректный список свечей")
+
+    required_keys = {"time", "open", "high", "low", "close"}
+
+    previous_time = None
+
+    for index, candle in enumerate(candles):
+        if not isinstance(candle, dict):
+            raise ValueError(f"Некорректная свеча с индексом {index}")
+
+        missing = required_keys - candle.keys()
+        if missing:
+            raise ValueError(
+                f"В свече {index} отсутствуют поля: {sorted(missing)}"
+            )
+
+        try:
+            timestamp = int(candle["time"])
+            open_price = float(candle["open"])
+            high = float(candle["high"])
+            low = float(candle["low"])
+            close = float(candle["close"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Некорректные данные свечи с индексом {index}"
+            ) from exc
+
+        if high < low:
+            raise ValueError(f"High ниже Low в свече {index}")
+
+        if not all(
+            price > 0 and price < float("inf")
+            for price in (open_price, high, low, close)
+        ):
+            raise ValueError(f"Некорректная цена в свече {index}")
+
+        if not low <= open_price <= high or not low <= close <= high:
+            raise ValueError(f"Цены свечи {index} выходят за диапазон High/Low")
+
+        if previous_time is not None and timestamp <= previous_time:
+            raise ValueError("Свечи идут не по возрастанию времени")
+
+        previous_time = timestamp
+
+    candles = remove_unclosed_candles(candles)
+
+    if len(candles) < WINDOW + 1:
+        raise ValueError(
+            f"Недостаточно закрытых свечей для бэктеста: {len(candles)}"
+        )
+
+    temp_file = CACHE_FILE.with_suffix(".tmp")
+    try:
+        temp_file.write_text(
+            json.dumps(candles, ensure_ascii=False, indent=2)
+        )
+        temp_file.replace(CACHE_FILE)
+    finally:
+        if temp_file.exists():
+            temp_file.unlink()
+
+    print(f"История сохранена в кэш: {CACHE_FILE.name}")
+    print(f"Количество свечей: {len(candles)}")
+    print(f"Первая свеча: {candles[0]['time']}")
+    print(f"Последняя свеча: {candles[-1]['time']}")
+
+    return candles
+
+
+
+def validate_plan(action, entry, stop, take):
+    if action == "long":
+        if stop >= entry:
+            return False, "LONG: стоп должен быть ниже входа"
+        if take <= entry:
+            return False, "LONG: тейк должен быть выше входа"
+
+    elif action == "short":
+        if stop <= entry:
+            return False, "SHORT: стоп должен быть выше входа"
+        if take >= entry:
+            return False, "SHORT: тейк должен быть ниже входа"
+
+    else:
+        return False, f"Неизвестное направление: {action}"
+
+    risk = abs(entry - stop)
+    reward = abs(take - entry)
+
+    if risk <= 0:
+        return False, "Риск должен быть больше нуля"
+
+    if reward / risk < 1.3:
+        return False, "R:R ниже минимального значения 1.3"
+
+    return True, "ok"
+
+
+def simulate_trade(
+    candles,
+    entry_idx,
+    action,
+    entry_price,
+    stop_loss,
+    take_profit,
+    max_hold=MAX_HOLD_BARS,
+    pip_size=PIP_SIZE,
+    check_entry_candle=False,
+    early_exit_mfe_max=None,
+    early_exit_mae_min=None,
+    early_exit_bars=4,
+    profit_protect_mfe=None,
+):
+    if pip_size <= 0:
+        raise ValueError("pip_size должен быть больше нуля")
+
+    if max_hold < 1:
+        raise ValueError("max_hold должен быть не меньше 1")
+
+    if early_exit_bars < 1:
+        raise ValueError("early_exit_bars должен быть не меньше 1")
+
+    if profit_protect_mfe is not None and profit_protect_mfe <= 0:
+        raise ValueError("profit_protect_mfe должен быть больше нуля")
+
+    profit_protection_active = False
+    best_favorable_mfe = 0.0
+
+    # Свеча входа входит в лимит, если проверяется.
+    hold_end_idx = (
+        entry_idx + max_hold - 1
+        if check_entry_candle
+        else entry_idx + max_hold
+    )
+    last_idx = min(hold_end_idx, len(candles) - 1)
+
+    first_checked_idx = (
+        entry_idx if check_entry_candle else entry_idx + 1
+    )
+
+    for i in range(first_checked_idx, last_idx + 1):
+        candle = candles[i]
+        high = float(candle["high"])
+        low = float(candle["low"])
+        open_price = float(candle["open"])
+
+        if action == "long":
+            # Учитываем гэп через стоп.
+            if open_price <= stop_loss:
+                exit_price = open_price
+                pips = (exit_price - entry_price) / pip_size
+                return {
+                    "result": "loss",
+                    "exit_reason": "stop",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+            hit_stop = low <= stop_loss
+            hit_take = high >= take_profit
+
+            # Если внутри свечи достигнуты оба уровня,
+            # считаем консервативно: первым сработал стоп.
+            if hit_stop:
+                exit_price = stop_loss
+                pips = (exit_price - entry_price) / pip_size
+                return {
+                    "result": "loss",
+                    "exit_reason": "stop",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+            if hit_take:
+                exit_price = take_profit
+                pips = (exit_price - entry_price) / pip_size
+                return {
+                    "result": "win",
+                    "exit_reason": "take",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+        else:
+            if open_price >= stop_loss:
+                exit_price = open_price
+                pips = (entry_price - exit_price) / pip_size
+                return {
+                    "result": "loss",
+                    "exit_reason": "stop",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+            hit_stop = high >= stop_loss
+            hit_take = low <= take_profit
+
+            if hit_stop:
+                exit_price = stop_loss
+                pips = (entry_price - exit_price) / pip_size
+                return {
+                    "result": "loss",
+                    "exit_reason": "stop",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+            if hit_take:
+                exit_price = take_profit
+                pips = (entry_price - exit_price) / pip_size
+                return {
+                    "result": "win",
+                    "exit_reason": "take",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                }
+
+        # Защита прибыли: после достижения заданного MFE
+        # ждём следующую свечу. При закрытии на нуле или ниже
+        # выходим по close. Stop Loss и Take Profit проверены выше.
+        if profit_protect_mfe is not None:
+            if action == "long":
+                current_mfe = (high - entry_price) / pip_size
+                close_pips = (
+                    float(candle["close"]) - entry_price
+                ) / pip_size
+            else:
+                current_mfe = (entry_price - low) / pip_size
+                close_pips = (
+                    entry_price - float(candle["close"])
+                ) / pip_size
+
+            best_favorable_mfe = max(
+                best_favorable_mfe, current_mfe
+            )
+
+            if profit_protection_active and close_pips <= 0:
+                exit_price = float(candle["close"])
+                result = (
+                    "win" if close_pips > 0
+                    else "loss" if close_pips < 0
+                    else "timeout"
+                )
+                return {
+                    "result": result,
+                    "exit_reason": "profit_protect",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": close_pips,
+                    "best_mfe": best_favorable_mfe,
+                }
+
+            # Активация происходит после проверки выхода:
+            # на свече достижения MFE закрытия по защите нет.
+            if (
+                not profit_protection_active
+                and best_favorable_mfe >= profit_protect_mfe
+            ):
+                profit_protection_active = True
+
+        # Экспериментальный выход после заданного количества свечей.
+        # Стоп и тейк текущей свечи проверяются раньше этого условия.
+        if (
+            early_exit_mfe_max is not None
+            and i == entry_idx + early_exit_bars - 1
+        ):
+            early_segment = candles[entry_idx:i + 1]
+            highest = max(float(c["high"]) for c in early_segment)
+            lowest = min(float(c["low"]) for c in early_segment)
+
+            if action == "long":
+                early_mfe = (highest - entry_price) / pip_size
+                early_mae = (entry_price - lowest) / pip_size
+                pips = (
+                    float(candles[i]["close"]) - entry_price
+                ) / pip_size
+            else:
+                early_mfe = (entry_price - lowest) / pip_size
+                early_mae = (highest - entry_price) / pip_size
+                pips = (
+                    entry_price - float(candles[i]["close"])
+                ) / pip_size
+
+            mfe_condition = early_mfe < early_exit_mfe_max
+            mae_condition = (
+                early_exit_mae_min is None
+                or early_mae > early_exit_mae_min
+            )
+
+            if mfe_condition and mae_condition:
+                exit_price = float(candles[i]["close"])
+                result = "win" if pips > 0 else "loss" if pips < 0 else "timeout"
+                return {
+                    "result": result,
+                    "exit_reason": "early_mfe_mae",
+                    "exit": exit_price,
+                    "bars_held": i - entry_idx,
+                    "pips": pips,
+                    "early_mfe": early_mfe,
+                    "early_mae": early_mae,
+                }
+
+    exit_idx = last_idx
+    exit_price = float(candles[exit_idx]["close"])
+
+    if action == "long":
+        pips = (exit_price - entry_price) / pip_size
+    else:
+        pips = (entry_price - exit_price) / pip_size
+
+    return {
+        "result": "timeout",
+        "exit_reason": "timeout",
+        "exit": exit_price,
+        "bars_held": exit_idx - entry_idx,
+        "pips": pips,
+    }
+
+
+def run_backtest(
+    candles,
+    single_position=True,
+    max_risk_atr=None,
+    atr_rejected_out=None,
+    max_hold_bars=MAX_HOLD_BARS,
+    early_exit_mfe_max=None,
+    early_exit_mae_min=None,
+    early_exit_bars=4,
+    profit_protect_mfe=None,
+):
+    trades = []
+    invalid_plans = 0
+    analyzer_errors = 0
+    diagnostics = {
+        "windows": 0,
+        "signals": 0,
+        "no_plan": 0,
+        "price_rejected": 0,
+        "invalid_position": 0,
+        "low_rr": 0,
+        "other_invalid": 0,
+        "position_busy": 0,
+        "risk_atr_rejected": 0,
+    }
+    last_exit_idx = -1
+
+    for i in range(WINDOW, len(candles) - max_hold_bars + 1, STEP):
+        diagnostics["windows"] += 1
+        window = candles[i - WINDOW:i]
+
+        try:
+            analyzer = MarketAnalyzer(
+                window,
+                symbol=SYMBOL,
+                closed_only=False,
+            )
+            state = analyzer.get_state()
+
+        except Exception as exc:
+            analyzer_errors += 1
+            print(
+                f"Ошибка анализа на свече {i}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        signal = state["signal"]
+        action = signal.get("action")
+
+        if action not in ("long", "short"):
+            continue
+
+        diagnostics["signals"] += 1
+
+        # Не открываем новую сделку, пока предыдущая не закрыта.
+        # Свечу выхода тоже пропускаем: новый вход возможен
+        # только на следующей свече или позже.
+        if single_position and i <= last_exit_idx:
+            diagnostics["position_busy"] += 1
+            continue
+
+        plan = signal.get("trade_plan")
+
+        if not plan:
+            diagnostics["no_plan"] += 1
+            continue
+
+        plan_entry = float(plan["entry"])
+        plan_stop = float(plan["stop_loss"])
+        plan_take = float(plan["take_profit"])
+
+        # Сигнал рассчитан по закрытым свечам до i-1.
+        # Вход моделируется по open следующей свечи.
+        entry = float(candles[i]["open"])
+
+        # Не входим, если цена слишком далеко ушла от плана.
+        pip_size = float(plan.get("pip_size", PIP_SIZE))
+        risk_pips = float(
+            plan.get("risk_pips", abs(plan_entry - plan_stop) / pip_size)
+        )
+        max_slippage = risk_pips * pip_size * 0.5
+
+        if abs(entry - plan_entry) > max_slippage:
+            diagnostics["price_rejected"] += 1
+            continue
+
+        # Сохраняем исходные уровни: не передвигаем стоп и тейк.
+        stop_loss = plan_stop
+        take_profit = plan_take
+
+        ok, message = validate_plan(
+            action, entry, stop_loss, take_profit
+        )
+
+        if not ok:
+            invalid_plans += 1
+
+            if "R:R ниже" in message:
+                diagnostics["low_rr"] += 1
+            elif "стоп должен быть" in message or "тейк должен быть" in message:
+                diagnostics["invalid_position"] += 1
+            else:
+                diagnostics["other_invalid"] += 1
+
+            print(
+                f"Невалидный план на свече {i}: "
+                f"{action.upper()}, {message}"
+            )
+            continue
+
+        # Фильтр ATR: проверяем только сигналы,
+        # прошедшие проверку цены входа и торгового плана.
+        atr_value = state.get("impulse", {}).get("atr")
+        risk_atr = None
+
+        if max_risk_atr is not None:
+            try:
+                atr_value = float(atr_value)
+            except (TypeError, ValueError):
+                atr_value = 0.0
+
+            if not 0 < atr_value < float("inf"):
+                diagnostics["risk_atr_rejected"] += 1
+                continue
+
+            risk_atr = abs(entry - stop_loss) / atr_value
+
+            if risk_atr > max_risk_atr:
+                diagnostics["risk_atr_rejected"] += 1
+
+                # Симулируем отклонённый сигнал отдельно.
+                # Он не занимает позицию в основном бэктесте.
+                hypothetical = simulate_trade(
+                    candles=candles,
+                    entry_idx=i,
+                    action=action,
+                    entry_price=entry,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    max_hold=max_hold_bars,
+                    pip_size=pip_size,
+                    check_entry_candle=True,
+                )
+
+                if atr_rejected_out is not None:
+                    atr_rejected_out.append({
+                        "idx": i,
+                        "time": candles[i].get("time", 0),
+                        "action": action,
+                        "score": int(signal.get("score", 0)),
+                        "plan_entry": plan_entry,
+                        "entry": entry,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "atr": atr_value,
+                        "risk_atr": risk_atr,
+                        **hypothetical,
+                    })
+
+                continue
+
+        outcome = simulate_trade(
+            candles=candles,
+            entry_idx=i,
+            action=action,
+            entry_price=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            max_hold=max_hold_bars,
+            pip_size=pip_size,
+            check_entry_candle=True,
+            early_exit_mfe_max=early_exit_mfe_max,
+            early_exit_mae_min=early_exit_mae_min,
+            early_exit_bars=early_exit_bars,
+            profit_protect_mfe=profit_protect_mfe,
+        )
+
+        last_exit_idx = i + outcome["bars_held"]
+
+        # ============================================================
+        # Диагностика торгового плана
+        # ============================================================
+        structure_state = state.get("structure", {})
+
+        if action == "long":
+            eligible_swings = [
+                x for x in structure_state.get("swing_lows", [])
+                if float(x["price"]) < plan_entry
+            ]
+
+            chosen_swing = (
+                max(eligible_swings, key=lambda x: float(x["price"]))
+                if eligible_swings
+                else None
+            )
+        else:
+            eligible_swings = [
+                x for x in structure_state.get("swing_highs", [])
+                if float(x["price"]) > plan_entry
+            ]
+
+            chosen_swing = (
+                min(eligible_swings, key=lambda x: float(x["price"]))
+                if eligible_swings
+                else None
+            )
+
+        # Возраст swing относительно последней свечи окна анализа.
+        swing_age_bars = (
+            WINDOW - 1 - int(chosen_swing["index"])
+            if chosen_swing is not None
+            else None
+        )
+
+        # Размер риска в единицах ATR.
+        risk_atr = (
+            abs(entry - plan_stop) / float(atr_value)
+            if atr_value is not None
+            and float(atr_value) > 0
+            else None
+        )
+
+        # ============================================================
+        # Сохранение сделки и диагностических полей
+        # ============================================================
+        trades.append({
+            "idx": i,
+            "time": candles[i].get("time", 0),
+
+            "action": action,
+            "score": int(signal.get("score", 0)),
+            "reason": signal.get("reason", ""),
+
+            # Цена входа и уровни исходного торгового плана.
+            "plan_entry": plan_entry,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+
+            # Диагностика риска.
+            "atr": atr_value,
+            "risk_pips": round(
+                abs(entry - stop_loss) / pip_size, 1
+            ),
+            "risk_atr": (
+                round(risk_atr, 2)
+                if risk_atr is not None
+                else None
+            ),
+
+            # Структурный экстремум, выбранный для диагностики.
+            "swing_price": (
+                float(chosen_swing["price"])
+                if chosen_swing is not None
+                else None
+            ),
+            "swing_age_bars": swing_age_bars,
+
+            # Результат моделирования сделки.
+            **outcome,
+        })
+
+    return trades, diagnostics, invalid_plans, analyzer_errors
+
+
+
+def calculate_net_pips(trades, spread_pips=0.0, slippage_pips=0.0):
+    """Рассчитывает P&L после заданных издержек в пипсах за сделку."""
+    spread_pips = float(spread_pips)
+    slippage_pips = float(slippage_pips)
+
+    if spread_pips < 0 or slippage_pips < 0:
+        raise ValueError("Издержки не могут быть отрицательными")
+
+    cost_per_trade = spread_pips + slippage_pips
+
+    return sum(float(trade["pips"]) - cost_per_trade for trade in trades)
+
+
+def calculate_metrics(trades):
+    wins = sum(t["result"] == "win" for t in trades)
+    losses = sum(t["result"] == "loss" for t in trades)
+    timeouts = sum(t["result"] == "timeout" for t in trades)
+
+    total_pips = sum(t["pips"] for t in trades)
+    gross_profit = sum(t["pips"] for t in trades if t["pips"] > 0)
+    gross_loss = sum(abs(t["pips"]) for t in trades if t["pips"] < 0)
+
+    resolved = wins + losses
+
+    return {
+        "total": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "timeouts": timeouts,
+        "total_pips": total_pips,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": (
+            gross_profit / gross_loss if gross_loss > 0 else None
+        ),
+        "winrate_resolved": (
+            wins / resolved * 100 if resolved else 0.0
+        ),
+        "winrate_all": (
+            wins / len(trades) * 100 if trades else 0.0
+        ),
+    }
+
+
+def format_time(value):
+    if value is None:
+        return "—"
+
+    try:
+        from datetime import datetime
+
+        if hasattr(value, "timestamp"):
+            timestamp = value.timestamp()
+        else:
+            timestamp = float(value)
+
+        if timestamp > 1e11:
+            timestamp /= 1000
+
+        return datetime.fromtimestamp(timestamp).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(value)
+
+
+async def main():
+    print("=" * 70)
+    print(f"BACKTEST — {SYMBOL}")
+    print("=" * 70)
+    print(f"Таймфрейм: {INTERVAL}m")
+    print(f"История: {HISTORY_BARS} свечей")
+    print(f"Окно анализа: {WINDOW}")
+    print(f"Максимальное удержание: {MAX_HOLD_BARS} свечей")
+    print("Модель входа: open следующей свечи; свеча входа входит в удержание")
+    print()
+
+    candles = await fetch_history()
+    print(f"Загружено свечей: {len(candles)}")
+
+    trades, diagnostics, invalid, errors = run_backtest(candles)
+    metrics = calculate_metrics(trades)
+
+    print("\\n" + "=" * 70)
+    print("СЦЕНАРНЫЙ АНАЛИЗ ТОРГОВЫХ ИЗДЕРЖЕК")
+    print("=" * 70)
+    print("Издержки условные: спред и проскальзывание пока не взяты из Bid/Ask.")
+    print(f"{'Затраты на сделку':<24} {'Чистый P&L':>15}")
+    print("-" * 42)
+
+    for cost in (0.0, 0.5, 1.0, 1.5):
+        net_pips = calculate_net_pips(
+            trades,
+            spread_pips=cost,
+            slippage_pips=0.0,
+        )
+        print(f"{cost:>6.1f} пипса{'':<17} {net_pips:>+12.1f} пипса")
+
+
+    print("\n" + "=" * 70)
+    print("РЕЗУЛЬТАТЫ")
+    print("=" * 70)
+    print(f"Всего сделок:           {metrics['total']}")
+    print(f"Тейков:                 {metrics['wins']}")
+    print(f"Стопов:                 {metrics['losses']}")
+    print(f"Таймаутов:              {metrics['timeouts']}")
+    print(f"Winrate без таймаутов:  {metrics['winrate_resolved']:.1f}%")
+    print(f"Winrate по всем сделкам:{metrics['winrate_all']:.1f}%")
+    print(f"Итоговый P&L:           {metrics['total_pips']:+.1f} пипса")
+    print(f"Gross Profit:           {metrics['gross_profit']:.1f} пипса")
+    print(f"Gross Loss:             {metrics['gross_loss']:.1f} пипса")
+
+    pf = metrics["profit_factor"]
+    if pf is None:
+        print("Profit Factor:          нет убыточных сделок")
+    else:
+        print(f"Profit Factor:          {pf:.2f}")
+
+    print(f"Невалидных планов:      {invalid}")
+    print(f"Ошибок анализа:         {errors}")
+
+    print("\nДИАГНОСТИКА СИГНАЛОВ")
+    print(f"Окон анализа:                 {diagnostics['windows']}")
+    print(f"Сигналов LONG/SHORT:          {diagnostics['signals']}")
+    print(f"Без торгового плана:          {diagnostics['no_plan']}")
+    print(f"Отсеяно по отклонению цены:   {diagnostics['price_rejected']}")
+    print(f"Стоп/тейк не с той стороны:   {diagnostics['invalid_position']}")
+    print(f"R:R ниже 1.3:                 {diagnostics['low_rr']}")
+    print(f"Другие невалидные планы:      {diagnostics['other_invalid']}")
+    print(f"Отклонено по ATR:             {diagnostics['risk_atr_rejected']}")
+
+    print("\nПО НАПРАВЛЕНИЯМ")
+    for side in ("long", "short"):
+        group = [t for t in trades if t["action"] == side]
+        if not group:
+            continue
+
+        pnl = sum(t["pips"] for t in group)
+        wins = sum(t["result"] == "win" for t in group)
+
+        print(
+            f"{side.upper()}: {len(group)} сделок, "
+            f"тейков {wins}, P&L {pnl:+.1f} пипса"
+        )
+
+    print("\nПО SCORE")
+    for low, high in ((0, 64), (65, 79), (80, 89), (90, 100)):
+        group = [t for t in trades if low <= t["score"] <= high]
+        if not group:
+            continue
+
+        pnl = sum(t["pips"] for t in group)
+        wins = sum(t["result"] == "win" for t in group)
+
+        print(
+            f"{low}-{high}: {len(group)} сделок, "
+            f"тейков {wins}, P&L {pnl:+.1f} пипса"
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
